@@ -1,25 +1,37 @@
-import cv2 # type: ignore
+import cv2
 import os
 import sqlite3
-from flask import Flask, request, render_template # type: ignore
+from flask import Flask, request, render_template, redirect, url_for, flash, session
 from datetime import date, datetime
-import numpy as np # type: ignore 
-from sklearn.neighbors import KNeighborsClassifier # type: ignore
-import joblib # type: ignore
+import numpy as np
+from sklearn.neighbors import KNeighborsClassifier
+import joblib
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
+from config import Config
 
 app = Flask(__name__)
+app.config.from_object(Config)
 
 nimgs = 10
 imgBackground = cv2.imread("background.png")
 datetoday2 = date.today().strftime("%d-%B-%Y")
 face_detector = cv2.CascadeClassifier('haarcascade_frontalface_default.xml')
-
+#login setup
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash('Please log in first.')
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
 # Database setup functions
 def init_db():
     conn = sqlite3.connect('attendance.db')
     c = conn.cursor()
     
-    # Create users table
+    # Create users table (existing)
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
@@ -28,7 +40,18 @@ def init_db():
         )
     ''')
     
-    # Create attendance table
+    # Create auth table (new)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS auth_users (
+            id INTEGER PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user'
+        )
+    ''')
+    
+    # Create attendance table (existing)
     c.execute('''
         CREATE TABLE IF NOT EXISTS attendance (
             id INTEGER PRIMARY KEY,
@@ -42,6 +65,59 @@ def init_db():
     
     conn.commit()
     conn.close()
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        
+        conn = sqlite3.connect('attendance.db')
+        c = conn.cursor()
+        
+        c.execute('SELECT * FROM auth_users WHERE username = ?', (username,))
+        user = c.fetchone()
+        conn.close()
+        
+        if user and check_password_hash(user[2], password):
+            session['user_id'] = user[0]
+            session['username'] = user[1]
+            session['role'] = user[4]
+            flash('Logged in successfully!')
+            return redirect(url_for('home'))
+        
+        flash('Invalid username or password')
+    return render_template('login.html')
+
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        email = request.form['email']
+        role = 'admin' if request.form.get('is_admin') else 'user'
+        
+        conn = sqlite3.connect('attendance.db')
+        c = conn.cursor()
+        
+        try:
+            hashed_password = generate_password_hash(password)
+            c.execute('INSERT INTO auth_users (username, password, email, role) VALUES (?, ?, ?, ?)',
+                     (username, hashed_password, email, role))
+            conn.commit()
+            flash('Account created successfully! Please login.')
+            return redirect(url_for('login'))
+        except sqlite3.IntegrityError:
+            flash('Username or email already exists!')
+        finally:
+            conn.close()
+            
+    return render_template('signup.html')
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash('Logged out successfully!')
+    return redirect(url_for('login'))
 
 def add_user_to_db(username, userid):
     conn = sqlite3.connect('attendance.db')
@@ -140,11 +216,20 @@ def train_model():
 
 # Modified routes
 @app.route('/')
+@login_required
 def home():
     names, rolls, times, l = get_attendance_data()
-    return render_template('home.html', names=names, rolls=rolls, times=times, l=l, totalreg=totalreg(), datetoday2=datetoday2)
+    return render_template('home.html', 
+                         names=names, 
+                         rolls=rolls, 
+                         times=times, 
+                         l=l, 
+                         totalreg=totalreg(), 
+                         datetoday2=datetoday2,
+                         username=session.get('username'))
 
 @app.route('/start', methods=['GET'])
+@login_required
 def start():
     names, rolls, times, l = get_attendance_data()
 
@@ -172,9 +257,15 @@ def start():
     cv2.destroyAllWindows()
     names, rolls, times, l = get_attendance_data()
     return render_template('home.html', names=names, rolls=rolls, times=times, l=l, totalreg=totalreg(), datetoday2=datetoday2)
+pass
 
 @app.route('/add', methods=['GET', 'POST'])
+@login_required
 def add():
+    # Check if user has admin role
+    if session.get('role') != 'admin':
+        flash('Only administrators can add new users!')
+        return redirect(url_for('home'))
     newusername = request.form['newusername']
     newuserid = request.form['newuserid']
     
@@ -210,8 +301,4 @@ def add():
     train_model()
     names, rolls, times, l = get_attendance_data()
     return render_template('home.html', names=names, rolls=rolls, times=times, l=l, totalreg=totalreg(), datetoday2=datetoday2)
-
-if __name__ == '__main__':
-    # Initialize database when starting the application
-    init_db()
-    app.run(debug=True, port=5001)
+    pass
